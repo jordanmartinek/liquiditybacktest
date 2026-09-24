@@ -53,5 +53,14 @@ On top of that signal core, the strategy adds real execution:
 4. Keep commission + slippage on — don't trust a pre-cost edge.
 5. Only then consider forward/paper testing.
 
+## No-volume instruments (NAS100, some forex/CFDs)
+
+Many index CFDs (e.g. **NAS100 / US100**) and some forex feeds report **no volume**. The SFP
+volume filter (`Require volume confirmation`) needs volume, so on those feeds it would otherwise
+block every signal — zero trades, and the Strategy Tester shows nothing to report. The strategy
+handles this automatically: when the instrument reports no volume, the volume gate is treated as
+satisfied so signals still fire. You can also just turn `Require volume confirmation` **off** in
+③ Structure.
+
 ## Related
 - Source indicator: https://github.com/jordanmartinek/liquidityindicator

@@ -145,9 +145,14 @@ dolMomRaw = 0.6 * dolTrendV + 0.4 * (dolRoc * 20.0)
 dolMom    = math.max(-1.0, math.min(1.0, dolMomRaw))
 
 // relative volume
+// NOTE: many index CFDs (e.g. NAS100/US100), some forex, and other synthetic
+// feeds report NO volume. On those, rvol stays 0 and the volume gate would
+// block EVERY SFP -> zero trades. So the gate only applies when the feed
+// actually carries volume; with no volume it is treated as satisfied.
 avgVol = ta.sma(volume, rvolLen)
 rvol   = nz(avgVol) > 0 ? volume / avgVol : 0.0
-volOK  = (not sfpUseVol) or (rvol >= rvolMult)
+hasVol = ta.cum(nz(volume)) > 0     // does this instrument report volume at all?
+volOK  = (not sfpUseVol) or (not hasVol) or (rvol >= rvolMult)
 
 // -----------------------------------------------------------------------------
 // HELPERS
