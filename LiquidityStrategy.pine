@@ -1,0 +1,810 @@
+//@version=6
+// =============================================================================
+// Liquidity Backtest  (Pine Script v6)
+// A TradingView STRATEGY() port of the "Liquidity Radar" indicator.
+//
+// Signal logic (level tracking, SFP sweep+reversal, DOL bias, per-level
+// confidence, confluence scoring, order blocks) is ported VERBATIM from
+// jordanmartinek/liquidityindicator -> LiquidityRadar.pine so backtest
+// signals == chart signals. Only the cosmetic drawing (banners, ghosts,
+// FVG boxes, tug-of-war meters) is dropped; it never affected signals.
+//
+// The strategy layer on top adds:
+//   • entries on the SFP bar close, gated by optional DOL-bias / confluence
+//   • stop beyond the sweep wick (± padATR) -> defines 1R
+//   • take-profit at the opposing liquidity pool (DOL magnet) or a fixed R
+//   • optional TP1 partial scale-out at 1R, runner to the pool
+//   • risk-based position sizing (riskPerTrade % of equity per trade)
+//   • optional session (killzone) filter
+//   • realistic commission + slippage in the strategy() header
+//
+// See STRATEGY_SPEC.md for the full handoff and the A/B validation plan.
+// =============================================================================
+strategy("Liquidity Backtest", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 1000, pyramiding = 0, calc_on_every_tick = false, commission_type = strategy.commission.percent, commission_value = 0.02, slippage = 2, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, close_entries_rule = "ANY")
+
+// Anchor plot so the compiler always sees a top-level drawing output.
+plot(na, "anchor", display = display.none)
+
+// -----------------------------------------------------------------------------
+// GROUP NAMES
+// -----------------------------------------------------------------------------
+var string G_PREV   = "① Previous-Period Levels"
+var string G_SESS   = "② Sessions"
+var string G_STRUCT = "③ Structure (swings · EQ · OB · SFP)"
+var string G_CLUST  = "④ Clustering & Confluence"
+var string G_DOL    = "⑤ Draw-on-Liquidity Model"
+var string G_TRADE  = "⑥ Strategy — Entries / Exits / Risk"
+var string G_STYLE  = "⑦ Style"
+
+// -----------------------------------------------------------------------------
+// INPUTS — PREVIOUS-PERIOD LEVELS
+// -----------------------------------------------------------------------------
+showPDHL = input.bool(true,  "Prev Day High/Low (PDH/PDL)",    group = G_PREV)
+showPWHL = input.bool(true,  "Prev Week High/Low (PWH/PWL)",   group = G_PREV)
+showPMHL = input.bool(false, "Prev Month High/Low (PMH/PML)",  group = G_PREV)
+showDO   = input.bool(false, "Daily Open",                     group = G_PREV)
+
+// -----------------------------------------------------------------------------
+// INPUTS — SESSIONS
+// -----------------------------------------------------------------------------
+sessTZ    = input.string("UTC", "Session Timezone", options = ["UTC","America/New_York","Europe/London","Asia/Tokyo"], group = G_SESS)
+showAsia  = input.bool(true,  "Asian Session H/L",   group = G_SESS)
+asiaSess  = input.session("0000-0800", "  Asian time",   group = G_SESS)
+showLond  = input.bool(true,  "London Session H/L",  group = G_SESS)
+londSess  = input.session("0800-1600", "  London time",  group = G_SESS)
+showNY    = input.bool(true,  "New York Session H/L", group = G_SESS)
+nySess    = input.session("1300-2100", "  New York time", group = G_SESS)
+sessResetDaily = input.bool(true, "Reset session H/L each new day", group = G_SESS)
+sessRemoveSwept = input.bool(true, "Remove session level once swept", group = G_SESS)
+sessReclassify = input.bool(true, "Reclassify unswept session H/L as swings", group = G_SESS)
+
+// -----------------------------------------------------------------------------
+// INPUTS — STRUCTURE
+// -----------------------------------------------------------------------------
+showSwing  = input.bool(true,  "Swing Highs/Lows (liquidity)", group = G_STRUCT)
+swingLen   = input.int(10, "  Swing pivot length", minval = 2, group = G_STRUCT)
+swingHist  = input.int(40, "  Historical swings kept (per side)", minval = 1, maxval = 200, group = G_STRUCT)
+htfSwingOn = input.bool(true, "  Add higher-timeframe swings", group = G_STRUCT)
+htfTF      = input.timeframe("240", "  HTF timeframe", group = G_STRUCT)
+htfLen     = input.int(5, "  HTF swing pivot length", minval = 2, group = G_STRUCT)
+removeSwept = input.bool(true, "Remove swept levels (swings, EQ, prev-period)", group = G_STRUCT)
+showEQ     = input.bool(true,  "Equal Highs/Lows (EQH/EQL)",   group = G_STRUCT)
+eqTol      = input.float(0.35, "  EQ tolerance (× ATR)", minval = 0.0, step = 0.05, group = G_STRUCT)
+eqLookback = input.int(6, "  EQ lookback (pivots)", minval = 1, maxval = 30, group = G_STRUCT)
+// --- SFP (sweep + reversal) ---
+showSFP    = input.bool(true, "Sweep + reversal detection (SFP)", group = G_STRUCT)
+sfpUseVol  = input.bool(true, "  Require volume confirmation", group = G_STRUCT)
+rvolLen    = input.int(20, "  Rel-volume lookback", minval = 5, maxval = 200, group = G_STRUCT)
+rvolMult   = input.float(1.5, "  Min rel-volume for grab", minval = 1.0, maxval = 5.0, step = 0.1, group = G_STRUCT)
+// --- Order Blocks (feed confluence + OB structure) ---
+showOB     = input.bool(true, "Order blocks after displacement", group = G_STRUCT)
+obDisp     = input.float(1.2, "  Displacement size (× ATR)", minval = 0.3, step = 0.1, group = G_STRUCT)
+obKeep     = input.int(8, "  Max order blocks kept", minval = 1, maxval = 40, group = G_STRUCT)
+
+// -----------------------------------------------------------------------------
+// INPUTS — CLUSTERING & CONFLUENCE
+// -----------------------------------------------------------------------------
+clusterOn  = input.bool(true, "Merge nearby levels into zones", group = G_CLUST)
+clustDist  = input.float(0.5, "Cluster distance (× ATR)", minval = 0.05, step = 0.05, group = G_CLUST)
+confRound  = input.float(0.0, "Round-number step (price)", minval = 0.0, group = G_CLUST)
+
+// -----------------------------------------------------------------------------
+// INPUTS — DRAW-ON-LIQUIDITY MODEL
+// -----------------------------------------------------------------------------
+dolSens    = input.string("Medium", "Gravity sensitivity", options = ["Low","Medium","High"], group = G_DOL)
+dolUseType = input.bool(true, "Weight by level importance (type)", group = G_DOL)
+dolUseAge  = input.bool(true, "Weight by level age (resting time)", group = G_DOL)
+dolMomWt   = input.float(30, "Momentum tilt %", minval = 0, maxval = 100, step = 5, group = G_DOL)
+dolConfW   = input.bool(true, "Weight pull by each level's confluence score", group = G_DOL)
+dolNearBias = input.float(1.5, "Nearest-pool emphasis", minval = 0.0, maxval = 4.0, step = 0.25, group = G_DOL)
+dolFreshW  = input.bool(true, "Freshness premium (untested pulls harder)", group = G_DOL)
+lvlConfMode = input.string("Magnet quality", "Confidence % basis", options = ["Magnet quality","Raw pull"], group = G_DOL)
+lvlConfWin  = input.int(5, "Confidence window (levels each side)", minval = 1, maxval = 50, group = G_DOL)
+
+// -----------------------------------------------------------------------------
+// INPUTS — STRATEGY (entries / exits / risk)
+// -----------------------------------------------------------------------------
+useDolBias   = input.bool(true,  "Gate entries by DOL bias", tooltip = "Long only when DOL bias draws UP, short only when it draws DOWN.", group = G_TRADE)
+useConfGate  = input.bool(false, "Gate entries by swept-level confluence", tooltip = "Only take the SFP if the swept level's confluence score >= threshold.", group = G_TRADE)
+confThresh   = input.int(40, "  Min confluence score", minval = 0, maxval = 100, group = G_TRADE)
+
+padATR       = input.float(0.25, "Stop pad beyond sweep wick (× ATR)", minval = 0.0, step = 0.05, group = G_TRADE)
+tgtMode      = input.string("Opposing pool", "Take-profit mode", options = ["Opposing pool","Fixed R"], group = G_TRADE)
+fixedR       = input.float(2.0, "  Fixed-R multiple", minval = 0.5, step = 0.5, group = G_TRADE)
+poolFallbackR = input.float(2.0, "  Fallback R when no opposing pool", minval = 0.5, step = 0.5, group = G_TRADE)
+
+useScaleOut  = input.bool(false, "Scale out: TP1 partial at 1R", group = G_TRADE)
+tp1Pct       = input.int(50, "  TP1 % of position closed at 1R", minval = 1, maxval = 99, group = G_TRADE)
+
+riskPerTrade = input.float(1.0, "Risk per trade (% of equity)", minval = 0.05, maxval = 10.0, step = 0.05, group = G_TRADE)
+
+useSessionFilter = input.bool(false, "Only enter during a session window", group = G_TRADE)
+tradeSess    = input.session("0800-1600", "  Trading session (killzone)", group = G_TRADE)
+
+// -----------------------------------------------------------------------------
+// INPUTS — STYLE
+// -----------------------------------------------------------------------------
+plotSignals = input.bool(true, "Plot SFP entry markers", group = G_STYLE)
+plotLevels  = input.bool(true, "Plot active stop/target lines", group = G_STYLE)
+colBull  = input.color(color.new(#26a69a, 0),  "Bullish / High color", group = G_STYLE)
+colBear  = input.color(color.new(#ef5350, 0),  "Bearish / Low color",  group = G_STYLE)
+colSess  = input.color(color.new(#42a5f5, 0),  "Session color",        group = G_STYLE)
+colZone  = input.color(color.new(#ffb300, 0),  "Cluster zone color",   group = G_STYLE)
+
+// -----------------------------------------------------------------------------
+// CORE SERIES
+// -----------------------------------------------------------------------------
+atr = ta.atr(14)
+
+// DOL momentum (per-bar, real history)
+dolEmaF   = ta.ema(close, 21)
+dolEmaS   = ta.ema(close, 55)
+dolTrendV = (dolEmaF - dolEmaS) / math.max(nz(atr), syminfo.mintick)
+dolRoc    = ta.roc(close, 9) / 100.0
+dolMomRaw = 0.6 * dolTrendV + 0.4 * (dolRoc * 20.0)
+dolMom    = math.max(-1.0, math.min(1.0, dolMomRaw))
+
+// relative volume
+// NOTE: many index CFDs (e.g. NAS100/US100), some forex, and other synthetic
+// feeds report NO volume. On those, rvol stays 0 and the volume gate would
+// block EVERY SFP -> zero trades. So the gate only applies when the feed
+// actually carries volume; with no volume it is treated as satisfied.
+avgVol = ta.sma(volume, rvolLen)
+rvol   = nz(avgVol) > 0 ? volume / avgVol : 0.0
+hasVol = ta.cum(nz(volume)) > 0     // does this instrument report volume at all?
+volOK  = (not sfpUseVol) or (not hasVol) or (rvol >= rvolMult)
+
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+f_sessName(string base, bool carried) =>
+    (sessReclassify and carried) ? (base + " (swing)") : base
+
+// -----------------------------------------------------------------------------
+// LEVEL SOURCES
+// -----------------------------------------------------------------------------
+pdh   = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl   = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
+pwh   = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+pwl   = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on)
+pmh   = request.security(syminfo.tickerid, "M", high[1], lookahead = barmerge.lookahead_on)
+pml   = request.security(syminfo.tickerid, "M", low[1],  lookahead = barmerge.lookahead_on)
+dOpen = request.security(syminfo.tickerid, "D", open,    lookahead = barmerge.lookahead_on)
+
+// -----------------------------------------------------------------------------
+// SESSIONS
+// -----------------------------------------------------------------------------
+f_inSession(string s) => not na(time(timeframe.period, s, sessTZ))
+newDay = ta.change(time("D", "0000-0000", sessTZ)) != 0
+
+f_sessHL(bool active, string sess) =>
+    var float hi        = na
+    var float lo        = na
+    var bool  prevIn    = false
+    var bool  hiCarried = false
+    var bool  loCarried = false
+    bool inS = f_inSession(sess)
+    if active
+        if sessResetDaily and newDay
+            hiCarried := not na(hi)
+            loCarried := not na(lo)
+        if inS and not prevIn
+            hi := high
+            lo := low
+            hiCarried := false
+            loCarried := false
+        else if inS
+            hi := math.max(nz(hi, high), high)
+            lo := math.min(nz(lo, low), low)
+        if sessRemoveSwept
+            if not na(hi) and high > hi
+                hi := na
+                hiCarried := false
+            if not na(lo) and low < lo
+                lo := na
+                loCarried := false
+    prevIn := inS
+    [hi, lo, hiCarried, loCarried]
+
+[asiaH, asiaL, asiaHc, asiaLc] = f_sessHL(showAsia, asiaSess)
+[londH, londL, londHc, londLc] = f_sessHL(showLond, londSess)
+[nyH,   nyL,   nyHc,   nyLc]   = f_sessHL(showNY,   nySess)
+
+// -----------------------------------------------------------------------------
+// SWINGS + HTF SWINGS
+// -----------------------------------------------------------------------------
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+f_htfPH() => ta.pivothigh(high, htfLen, htfLen)
+f_htfPL() => ta.pivotlow(low, htfLen, htfLen)
+htfPH = htfSwingOn ? request.security(syminfo.tickerid, htfTF, f_htfPH(), lookahead = barmerge.lookahead_off) : na
+htfPL = htfSwingOn ? request.security(syminfo.tickerid, htfTF, f_htfPL(), lookahead = barmerge.lookahead_off) : na
+htfPHchg = not na(htfPH) and (na(htfPH[1]) or htfPH != htfPH[1])
+htfPLchg = not na(htfPL) and (na(htfPL[1]) or htfPL != htfPL[1])
+
+var float lastPH = na
+var float lastPL = na
+var int rangeDir = 0
+if not na(ph)
+    lastPH := ph
+    rangeDir := -1
+if not na(pl)
+    lastPL := pl
+    rangeDir := 1
+
+// LIVE dealing range (for the confluence OTE / premium-discount factor)
+var float rngHi = na
+var float rngLo = na
+if not na(pl)
+    rngLo := pl
+    rngHi := math.max(nz(rngHi, high), high)
+if not na(ph)
+    rngHi := ph
+    rngLo := math.min(nz(rngLo, low), low)
+if rangeDir >= 0
+    rngHi := math.max(nz(rngHi, high), high)
+else
+    rngLo := math.min(nz(rngLo, low), low)
+
+// OTE retracement ratios used by the confluence score
+var float pdFib1 = 0.705
+var float pdFib2 = 0.788
+var float pdFib3 = 0.886
+
+// historical swing storage
+var swHi   = array.new<float>()
+var swHiB  = array.new<int>()
+var swLo   = array.new<float>()
+var swLoB  = array.new<int>()
+
+if showSwing and not na(ph)
+    array.push(swHi, ph)
+    array.push(swHiB, bar_index - swingLen)
+if showSwing and not na(pl)
+    array.push(swLo, pl)
+    array.push(swLoB, bar_index - swingLen)
+if showSwing and htfSwingOn and htfPHchg
+    array.push(swHi, htfPH)
+    array.push(swHiB, na)
+if showSwing and htfSwingOn and htfPLchg
+    array.push(swLo, htfPL)
+    array.push(swLoB, na)
+
+// sweep-removal from swing arrays
+if removeSwept and array.size(swHi) > 0
+    int ih = 0
+    while ih < array.size(swHi)
+        if high > array.get(swHi, ih)
+            array.remove(swHi, ih)
+            array.remove(swHiB, ih)
+        else
+            ih += 1
+if removeSwept and array.size(swLo) > 0
+    int il = 0
+    while il < array.size(swLo)
+        if low < array.get(swLo, il)
+            array.remove(swLo, il)
+            array.remove(swLoB, il)
+        else
+            il += 1
+while array.size(swHi) > swingHist
+    array.shift(swHi)
+    array.shift(swHiB)
+while array.size(swLo) > swingHist
+    array.shift(swLo)
+    array.shift(swLoB)
+
+// -----------------------------------------------------------------------------
+// EQUAL HIGHS / LOWS — rolling-buffer detection
+// -----------------------------------------------------------------------------
+float eqTolPrice = nz(atr) * eqTol
+var pvHi  = array.new<float>()
+var pvLo  = array.new<float>()
+var eqHiA = array.new<float>()
+var eqHiB = array.new<int>()
+var eqLoA = array.new<float>()
+var eqLoB = array.new<int>()
+
+if showEQ and not na(ph)
+    bool found = false
+    float matched = na
+    int hs = array.size(pvHi)
+    if hs > 0
+        int start = math.max(hs - eqLookback, 0)
+        for qi = start to hs - 1
+            float prevH = array.get(pvHi, qi)
+            if math.abs(ph - prevH) <= eqTolPrice
+                found := true
+                matched := math.max(ph, prevH)
+    if found
+        array.push(eqHiA, matched)
+        array.push(eqHiB, bar_index - swingLen)
+    array.push(pvHi, ph)
+    while array.size(pvHi) > 40
+        array.shift(pvHi)
+
+if showEQ and not na(pl)
+    bool found = false
+    float matched = na
+    int ls = array.size(pvLo)
+    if ls > 0
+        int start = math.max(ls - eqLookback, 0)
+        for qi = start to ls - 1
+            float prevL = array.get(pvLo, qi)
+            if math.abs(pl - prevL) <= eqTolPrice
+                found := true
+                matched := math.min(pl, prevL)
+    if found
+        array.push(eqLoA, matched)
+        array.push(eqLoB, bar_index - swingLen)
+    array.push(pvLo, pl)
+    while array.size(pvLo) > 40
+        array.shift(pvLo)
+
+if array.size(eqHiA) > 0
+    int i = 0
+    while i < array.size(eqHiA)
+        if removeSwept and high > array.get(eqHiA, i)
+            array.remove(eqHiA, i)
+            array.remove(eqHiB, i)
+        else
+            i += 1
+if array.size(eqLoA) > 0
+    int i = 0
+    while i < array.size(eqLoA)
+        if removeSwept and low < array.get(eqLoA, i)
+            array.remove(eqLoA, i)
+            array.remove(eqLoB, i)
+        else
+            i += 1
+while array.size(eqHiA) > swingHist
+    array.shift(eqHiA)
+    array.shift(eqHiB)
+while array.size(eqLoA) > swingHist
+    array.shift(eqLoA)
+    array.shift(eqLoB)
+
+// -----------------------------------------------------------------------------
+// BIRTH-BAR TRACKING (for DOL age weight)
+// -----------------------------------------------------------------------------
+var int b_pdh = na, var int b_pdl = na
+var int b_pwh = na, var int b_pwl = na
+var int b_pmh = na, var int b_pml = na
+var int b_do  = na
+var int b_ah  = na, var int b_al = na
+var int b_lh  = na, var int b_ll = na
+var int b_nh  = na, var int b_nl = na
+b_pdh := (na(b_pdh) or pdh != pdh[1]) ? bar_index : b_pdh
+b_pdl := (na(b_pdl) or pdl != pdl[1]) ? bar_index : b_pdl
+b_pwh := (na(b_pwh) or pwh != pwh[1]) ? bar_index : b_pwh
+b_pwl := (na(b_pwl) or pwl != pwl[1]) ? bar_index : b_pwl
+b_pmh := (na(b_pmh) or pmh != pmh[1]) ? bar_index : b_pmh
+b_pml := (na(b_pml) or pml != pml[1]) ? bar_index : b_pml
+b_do  := (na(b_do)  or dOpen != dOpen[1]) ? bar_index : b_do
+b_ah  := (na(b_ah)  or asiaH != asiaH[1]) ? bar_index : b_ah
+b_al  := (na(b_al)  or asiaL != asiaL[1]) ? bar_index : b_al
+b_lh  := (na(b_lh)  or londH != londH[1]) ? bar_index : b_lh
+b_ll  := (na(b_ll)  or londL != londL[1]) ? bar_index : b_ll
+b_nh  := (na(b_nh)  or nyH != nyH[1]) ? bar_index : b_nh
+b_nl  := (na(b_nl)  or nyL != nyL[1]) ? bar_index : b_nl
+
+// -----------------------------------------------------------------------------
+// SWEEP MASKING for previous-period levels
+// -----------------------------------------------------------------------------
+var bool sw_pdh = false, var bool sw_pdl = false
+var bool sw_pwh = false, var bool sw_pwl = false
+var bool sw_pmh = false, var bool sw_pml = false
+sw_pdh := (pdh != pdh[1]) ? false : (sw_pdh or (not na(pdh) and high > pdh))
+sw_pdl := (pdl != pdl[1]) ? false : (sw_pdl or (not na(pdl) and low  < pdl))
+sw_pwh := (pwh != pwh[1]) ? false : (sw_pwh or (not na(pwh) and high > pwh))
+sw_pwl := (pwl != pwl[1]) ? false : (sw_pwl or (not na(pwl) and low  < pwl))
+sw_pmh := (pmh != pmh[1]) ? false : (sw_pmh or (not na(pmh) and high > pmh))
+sw_pml := (pml != pml[1]) ? false : (sw_pml or (not na(pml) and low  < pml))
+pdhM = (removeSwept and sw_pdh) ? na : pdh
+pdlM = (removeSwept and sw_pdl) ? na : pdl
+pwhM = (removeSwept and sw_pwh) ? na : pwh
+pwlM = (removeSwept and sw_pwl) ? na : pwl
+pmhM = (removeSwept and sw_pmh) ? na : pmh
+pmlM = (removeSwept and sw_pml) ? na : pml
+
+// -----------------------------------------------------------------------------
+// SFP (sweep + reversal) DETECTION
+// -----------------------------------------------------------------------------
+lvHiNow = array.new<float>()
+lvLoNow = array.new<float>()
+if showSFP
+    if not na(pdhM)
+        array.push(lvHiNow, pdhM)
+    if not na(pwhM)
+        array.push(lvHiNow, pwhM)
+    if not na(pmhM)
+        array.push(lvHiNow, pmhM)
+    if not na(pdlM)
+        array.push(lvLoNow, pdlM)
+    if not na(pwlM)
+        array.push(lvLoNow, pwlM)
+    if not na(pmlM)
+        array.push(lvLoNow, pmlM)
+    if not na(asiaH)
+        array.push(lvHiNow, asiaH)
+    if not na(londH)
+        array.push(lvHiNow, londH)
+    if not na(nyH)
+        array.push(lvHiNow, nyH)
+    if not na(asiaL)
+        array.push(lvLoNow, asiaL)
+    if not na(londL)
+        array.push(lvLoNow, londL)
+    if not na(nyL)
+        array.push(lvLoNow, nyL)
+    if array.size(swHi) > 0
+        for si = 0 to array.size(swHi) - 1
+            array.push(lvHiNow, array.get(swHi, si))
+    if array.size(swLo) > 0
+        for si = 0 to array.size(swLo) - 1
+            array.push(lvLoNow, array.get(swLo, si))
+    if array.size(eqHiA) > 0
+        for si = 0 to array.size(eqHiA) - 1
+            array.push(lvHiNow, array.get(eqHiA, si))
+    if array.size(eqLoA) > 0
+        for si = 0 to array.size(eqLoA) - 1
+            array.push(lvLoNow, array.get(eqLoA, si))
+
+float sweptHiLvl = na
+float sweptLoLvl = na
+if showSFP and array.size(lvHiNow) > 0
+    for si = 0 to array.size(lvHiNow) - 1
+        float lv = array.get(lvHiNow, si)
+        if high > lv and close < lv
+            if na(sweptHiLvl) or lv > sweptHiLvl
+                sweptHiLvl := lv
+if showSFP and array.size(lvLoNow) > 0
+    for si = 0 to array.size(lvLoNow) - 1
+        float lv = array.get(lvLoNow, si)
+        if low < lv and close > lv
+            if na(sweptLoLvl) or lv < sweptLoLvl
+                sweptLoLvl := lv
+
+bool sfpShort = showSFP and not na(sweptHiLvl) and volOK
+bool sfpLong  = showSFP and not na(sweptLoLvl) and volOK
+
+// -----------------------------------------------------------------------------
+// ORDER BLOCKS (feed the confluence score + structural context)
+// -----------------------------------------------------------------------------
+float bodySize = math.abs(close - open)
+bool  disp     = bodySize >= obDisp * nz(atr)
+var obTop  = array.new<float>()
+var obBot  = array.new<float>()
+var obBull = array.new<bool>()
+var obBirth = array.new<int>()
+if showOB and disp and close > open and (sfpLong or (close > high[1]))
+    array.push(obTop, high[1])
+    array.push(obBot, low[1])
+    array.push(obBull, true)
+    array.push(obBirth, bar_index - 1)
+if showOB and disp and close < open and (sfpShort or (close < low[1]))
+    array.push(obTop, high[1])
+    array.push(obBot, low[1])
+    array.push(obBull, false)
+    array.push(obBirth, bar_index - 1)
+if array.size(obTop) > 0
+    int oi = 0
+    while oi < array.size(obTop)
+        bool bull = array.get(obBull, oi)
+        bool dead = bull ? (close < array.get(obBot, oi)) : (close > array.get(obTop, oi))
+        if dead
+            array.remove(obTop, oi)
+            array.remove(obBot, oi)
+            array.remove(obBull, oi)
+            array.remove(obBirth, oi)
+        else
+            oi += 1
+while array.size(obTop) > obKeep
+    array.shift(obTop)
+    array.shift(obBot)
+    array.shift(obBull)
+    array.shift(obBirth)
+
+// -----------------------------------------------------------------------------
+// CONFLUENCE SCORE (ported from indicator; used by DOL confW and the entry gate)
+// -----------------------------------------------------------------------------
+f_confScore(float mid, float loB, float hiB, int members) =>
+    float score = 0.0
+    string parts = ""
+    float tol = math.max(nz(atr) * 0.25, syminfo.mintick)
+    score := score + math.min(members, 5) * 12.0
+    if members >= 2
+        parts := parts + "stack "
+    bool obHit = false
+    if array.size(obTop) > 0
+        for oi = 0 to array.size(obTop) - 1
+            if hiB >= array.get(obBot, oi) and loB <= array.get(obTop, oi)
+                obHit := true
+    if obHit
+        score := score + 22.0
+        parts := parts + "OB "
+    if not na(rngHi) and not na(rngLo) and rngHi > rngLo
+        float rng = rngHi - rngLo
+        bool bullLeg = rangeDir >= 0
+        f1 = bullLeg ? (rngHi - pdFib1 * rng) : (rngLo + pdFib1 * rng)
+        f2 = bullLeg ? (rngHi - pdFib2 * rng) : (rngLo + pdFib2 * rng)
+        f3 = bullLeg ? (rngHi - pdFib3 * rng) : (rngLo + pdFib3 * rng)
+        bool fibHit = (math.abs(mid - f1) <= tol) or (math.abs(mid - f2) <= tol) or (math.abs(mid - f3) <= tol)
+        if fibHit
+            score := score + 18.0
+            parts := parts + "OTE "
+        float pos = (mid - rngLo) / rng
+        if pos >= 0.75 or pos <= 0.25
+            score := score + 8.0
+            parts := parts + (pos >= 0.75 ? "prem " : "disc ")
+    if confRound > 0
+        float nearest = math.round(mid / confRound) * confRound
+        if math.abs(mid - nearest) <= tol
+            score := score + 10.0
+            parts := parts + "round "
+    int s = int(math.min(math.round(score), 100))
+    [s, parts]
+
+// -----------------------------------------------------------------------------
+// DOL pull + magnet-quality (ported from indicator f_pull)
+// -----------------------------------------------------------------------------
+f_pull(float pk, string nk, int bk, float sensK, float atrU) =>
+    float dist = math.abs(pk - close)
+    float distW = math.pow(1.0 / (1.0 + sensK * (dist / atrU)), 1.0 + dolNearBias)
+    float typeW = 1.0
+    if dolUseType
+        if str.contains(nk, "EQ")
+            typeW := 2.4
+        else if str.contains(nk, "PMH") or str.contains(nk, "PML")
+            typeW := 2.2
+        else if str.contains(nk, "PWH") or str.contains(nk, "PWL")
+            typeW := 1.9
+        else if str.contains(nk, "PDH") or str.contains(nk, "PDL")
+            typeW := 1.6
+        else if str.contains(nk, "London") or str.contains(nk, "NY") or str.contains(nk, "Asia")
+            typeW := 1.2
+        typeW := 1.0 + (typeW - 1.0) * sensK
+    float ageW = 1.0
+    if dolUseAge and not na(bk)
+        float ageBars = math.max(0.0, bar_index - bk)
+        ageW := 1.0 + math.min(1.0, math.log(1.0 + ageBars) / 6.0) * sensK
+    float freshW = 1.0
+    if dolFreshW
+        freshW := dist < atrU * 0.15 ? 0.6 : 1.0
+    float confW = 1.0
+    if dolConfW
+        [cs, cp] = f_confScore(pk, pk - atrU * 0.05, pk + atrU * 0.05, 1)
+        confW := 1.0 + cs / 100.0
+    float qual = typeW * ageW * freshW * confW
+    float pull = distW * qual
+    [pull, qual]
+
+// -----------------------------------------------------------------------------
+// LEVEL COLLECTION (rebuilt every bar for the strategy — bias/target need it live)
+// -----------------------------------------------------------------------------
+var lv_price = array.new<float>()
+var lv_name  = array.new<string>()
+var lv_birth = array.new<int>()
+var lv_side  = array.new<int>()
+
+f_addLevel(bool active, float price, string name, int birthBar, int side) =>
+    if active and not na(price)
+        array.push(lv_price, price)
+        array.push(lv_name, name)
+        array.push(lv_birth, birthBar)
+        array.push(lv_side, side)
+
+array.clear(lv_price)
+array.clear(lv_name)
+array.clear(lv_birth)
+array.clear(lv_side)
+
+f_addLevel(showPDHL, pdhM,   "PDH",     b_pdh,  1)
+f_addLevel(showPDHL, pdlM,   "PDL",     b_pdl, -1)
+f_addLevel(showPWHL, pwhM,   "PWH",     b_pwh,  1)
+f_addLevel(showPWHL, pwlM,   "PWL",     b_pwl, -1)
+f_addLevel(showPMHL, pmhM,   "PMH",     b_pmh,  1)
+f_addLevel(showPMHL, pmlM,   "PML",     b_pml, -1)
+f_addLevel(showDO,   dOpen,  "D.Open",  b_do,   0)
+f_addLevel(showAsia, asiaH,  f_sessName("Asia H", asiaHc),   b_ah,   1)
+f_addLevel(showAsia, asiaL,  f_sessName("Asia L", asiaLc),   b_al,  -1)
+f_addLevel(showLond, londH,  f_sessName("London H", londHc), b_lh,   1)
+f_addLevel(showLond, londL,  f_sessName("London L", londLc), b_ll,  -1)
+f_addLevel(showNY,   nyH,    f_sessName("NY H", nyHc),       b_nh,   1)
+f_addLevel(showNY,   nyL,    f_sessName("NY L", nyLc),       b_nl,  -1)
+if showSwing
+    if array.size(swHi) > 0
+        for si = 0 to array.size(swHi) - 1
+            f_addLevel(true, array.get(swHi, si), "BSL", array.get(swHiB, si), 1)
+    if array.size(swLo) > 0
+        for si = 0 to array.size(swLo) - 1
+            f_addLevel(true, array.get(swLo, si), "SSL", array.get(swLoB, si), -1)
+if showEQ
+    if array.size(eqHiA) > 0
+        for ei = 0 to array.size(eqHiA) - 1
+            f_addLevel(true, array.get(eqHiA, ei), "EQH", array.get(eqHiB, ei), 1)
+    if array.size(eqLoA) > 0
+        for ei = 0 to array.size(eqLoA) - 1
+            f_addLevel(true, array.get(eqLoA, ei), "EQL", array.get(eqLoB, ei), -1)
+
+// -----------------------------------------------------------------------------
+// DOL gravity tally + bias + magnet targets (ported from indicator)
+// -----------------------------------------------------------------------------
+float bslStrength = 0.0
+float sslStrength = 0.0
+float bslTopPull  = 0.0
+float sslTopPull  = 0.0
+float bslTopPrice = na   // nearest-strongest BSL magnet (above price)
+float sslTopPrice = na   // nearest-strongest SSL magnet (below price)
+int nl = array.size(lv_price)
+if nl > 0
+    float sensK = dolSens == "High" ? 2.0 : dolSens == "Low" ? 0.5 : 1.0
+    float atrU  = math.max(nz(atr), syminfo.mintick)
+    for k = 0 to nl - 1
+        float pk = array.get(lv_price, k)
+        string nk = array.get(lv_name, k)
+        int   bk = array.get(lv_birth, k)
+        [pull, qual] = f_pull(pk, nk, bk, sensK, atrU)
+        if pk >= close
+            bslStrength := bslStrength + pull
+            if pull > bslTopPull
+                bslTopPull  := pull
+                bslTopPrice := pk
+        else
+            sslStrength := sslStrength + pull
+            if pull > sslTopPull
+                sslTopPull  := pull
+                sslTopPrice := pk
+
+float dm_totalG  = bslStrength + sslStrength
+float dm_liqBias = dm_totalG > 0 ? (bslStrength - sslStrength) / dm_totalG : 0.0
+float dm_bias    = (1.0 - dolMomWt / 100.0) * dm_liqBias + (dolMomWt / 100.0) * dolMom
+bool  dolDrawUp  = dm_bias >= 0
+
+// nearest un-swept opposing pool for targets
+f_nearestAbove() =>
+    float best = na
+    if array.size(lv_price) > 0
+        for k = 0 to array.size(lv_price) - 1
+            float p = array.get(lv_price, k)
+            if p > close and (na(best) or p < best)
+                best := p
+    best
+f_nearestBelow() =>
+    float best = na
+    if array.size(lv_price) > 0
+        for k = 0 to array.size(lv_price) - 1
+            float p = array.get(lv_price, k)
+            if p < close and (na(best) or p > best)
+                best := p
+    best
+float nearestBSL = f_nearestAbove()
+float nearestSSL = f_nearestBelow()
+
+// =============================================================================
+// STRATEGY LAYER
+// =============================================================================
+// Session gate for entries
+inTradeSess = (not useSessionFilter) or (not na(time(timeframe.period, tradeSess, sessTZ)))
+
+// Confluence of the swept level (only meaningful when a level was swept)
+atrU3 = math.max(nz(atr), syminfo.mintick)
+[confHi, cpHi] = f_confScore(nz(sweptHiLvl, close), nz(sweptHiLvl, close) - atrU3 * 0.05, nz(sweptHiLvl, close) + atrU3 * 0.05, 1)
+[confLo, cpLo] = f_confScore(nz(sweptLoLvl, close), nz(sweptLoLvl, close) - atrU3 * 0.05, nz(sweptLoLvl, close) + atrU3 * 0.05, 1)
+
+// Entry gates
+biasLongOK  = (not useDolBias) or dolDrawUp
+biasShortOK = (not useDolBias) or (not dolDrawUp)
+confLongOK  = (not useConfGate) or (confLo >= confThresh)
+confShortOK = (not useConfGate) or (confHi >= confThresh)
+
+goLong  = sfpLong  and biasLongOK  and confLongOK  and inTradeSess
+goShort = sfpShort and biasShortOK and confShortOK and inTradeSess
+
+// Stop = beyond the sweep wick of THIS SFP bar, padded by padATR × ATR -> defines 1R
+pad = padATR * atrU3
+longStop  = low  - pad
+shortStop = high + pad
+
+// Take-profit resolution
+// Long: opposing pool = nearest un-swept BSL above; short: nearest un-swept SSL below.
+var float pendLongTP  = na
+var float pendShortTP = na
+
+f_longTP(float entry, float stop) =>
+    float risk = math.max(entry - stop, syminfo.mintick)
+    float tp = na
+    if tgtMode == "Fixed R"
+        tp := entry + fixedR * risk
+    else
+        // prefer the nearest strong BSL magnet, else nearest BSL above, else fallback R
+        float pool = not na(bslTopPrice) and bslTopPrice > entry ? bslTopPrice : (not na(nearestBSL) and nearestBSL > entry ? nearestBSL : na)
+        tp := na(pool) ? entry + poolFallbackR * risk : pool
+    tp
+
+f_shortTP(float entry, float stop) =>
+    float risk = math.max(stop - entry, syminfo.mintick)
+    float tp = na
+    if tgtMode == "Fixed R"
+        tp := entry - fixedR * risk
+    else
+        float pool = not na(sslTopPrice) and sslTopPrice < entry ? sslTopPrice : (not na(nearestSSL) and nearestSSL < entry ? nearestSSL : na)
+        tp := na(pool) ? entry - poolFallbackR * risk : pool
+    tp
+
+// Position sizing: qty = (equity * risk%) / (per-unit risk distance)
+f_qty(float entry, float stop) =>
+    float perUnit = math.abs(entry - stop)
+    float riskCap = strategy.equity * (riskPerTrade / 100.0)
+    perUnit > 0 ? riskCap / perUnit : na
+
+// --- ENTRIES (fire on the closed SFP bar; fills next bar open) ---
+// Track the trade's stop/target/1R so exits and scale-out are stable across bars.
+var float curStop   = na
+var float curTP     = na
+var float curR      = na
+
+if goLong and strategy.position_size == 0
+    float entryRef = close
+    float stp = longStop
+    float tp  = f_longTP(entryRef, stp)
+    float q   = f_qty(entryRef, stp)
+    if not na(q) and q > 0 and stp < entryRef
+        strategy.entry("Long", strategy.long, qty = q)
+        curStop   := stp
+        curTP     := tp
+        curR      := entryRef - stp
+
+if goShort and strategy.position_size == 0
+    float entryRef = close
+    float stp = shortStop
+    float tp  = f_shortTP(entryRef, stp)
+    float q   = f_qty(entryRef, stp)
+    if not na(q) and q > 0 and stp > entryRef
+        strategy.entry("Short", strategy.short, qty = q)
+        curStop   := stp
+        curTP     := tp
+        curR      := stp - entryRef
+
+// --- EXITS ---
+// Exit IDs are kept STABLE for the life of a trade (Pine updates the standing
+// order instead of stacking a new one). Scale-out uses two orders: a partial at
+// 1R (qty_percent) and a runner to the pool target; both share the protective
+// stop. Without scale-out a single order carries stop + pool/fixed-R target.
+if strategy.position_size > 0
+    float entryP = strategy.position_avg_price
+    float tp1 = entryP + nz(curR, atrU3)
+    if useScaleOut
+        strategy.exit("L-TP1", from_entry = "Long", stop = curStop, limit = tp1, qty_percent = tp1Pct)
+        strategy.exit("L-Run", from_entry = "Long", stop = curStop, limit = curTP)
+    else
+        strategy.exit("L-X", from_entry = "Long", stop = curStop, limit = curTP)
+
+if strategy.position_size < 0
+    float entryP = strategy.position_avg_price
+    float tp1 = entryP - nz(curR, atrU3)
+    if useScaleOut
+        strategy.exit("S-TP1", from_entry = "Short", stop = curStop, limit = tp1, qty_percent = tp1Pct)
+        strategy.exit("S-Run", from_entry = "Short", stop = curStop, limit = curTP)
+    else
+        strategy.exit("S-X", from_entry = "Short", stop = curStop, limit = curTP)
+
+// reset trade state when flat
+if strategy.position_size == 0
+    curStop   := na
+    curTP     := na
+    curR      := na
+
+// -----------------------------------------------------------------------------
+// PLOTTING (signals + active stop/target)
+// -----------------------------------------------------------------------------
+plotshape(plotSignals and goLong,  title = "SFP Long",  location = location.belowbar, style = shape.triangleup,   color = colBull, size = size.small, text = "SFP▲")
+plotshape(plotSignals and goShort, title = "SFP Short", location = location.abovebar, style = shape.triangledown, color = colBear, size = size.small, text = "SFP▼")
+
+plot(plotLevels and strategy.position_size != 0 ? curStop : na, title = "Stop",   color = color.new(colBear, 0), style = plot.style_linebr, linewidth = 1)
+plot(plotLevels and strategy.position_size != 0 ? curTP   : na, title = "Target", color = color.new(colBull, 0), style = plot.style_linebr, linewidth = 1)
+
+// DOL bias context tint (for reading the backtest): green when bias draws UP,
+// red when it draws DOWN. Only shown when the DOL-bias gate is active.
+bgcolor(useDolBias ? color.new(dolDrawUp ? colBull : colBear, 94) : na, title = "DOL bias tint")
