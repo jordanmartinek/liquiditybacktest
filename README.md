@@ -11,5 +11,13 @@ liquidity approach (sweep + reversal entries, DOL bias, confluence, liquidity-po
 - **Seed:** `STRATEGY_SPEC.md` handoff doc. No strategy code yet.
 - **Next:** build `LiquidityStrategy.pine` (`strategy()`) per the spec, then backtest.
 
+## Machine learning
+See **[`ML_INTEGRATION_PLAN.md`](./ML_INTEGRATION_PLAN.md)** for how (and how not) to apply ML:
+the honest constraints (Pine can't run ML — train offline, hardcode results, or run in the bot),
+the per-level feature set the indicator already produces, ranked high-value uses (calibrate the
+confidence %, learn the confluence/pull weights, SFP setup classifier, regime detection), and the
+data → train → validate → ship pipeline. ML optimizes an existing edge; it does not create one.
+
 ## Related
 - Source indicator: https://github.com/jordanmartinek/liquidityindicator
+- Bot / ML-filter design: `liq-ai-bot/DESIGN.md`
